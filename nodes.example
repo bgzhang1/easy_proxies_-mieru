@@ -8,6 +8,9 @@ vless://c5f7fbb5-2018-4295-8ff9-340d720c63c9@hinet-tw-01-ddns.sakuraikaede.com:3
 # Hysteria2 协议示例
 hysteria2://c5f7fbb5-2018-4295-8ff9-340d720c63c9@hinet-tw-01-ddns.sakuraikaede.com:30002?sni=hinet.eessgrgrgrgr.cloudns.nz&insecure=0#TW-Hysteria2节点
 
+# Mieru protocol example
+mierus://user:password@example.com?profile=default&port=2999&protocol=TCP#Mieru-Node
+
 # Shadowsocks 协议示例
 ss://MjAyMi1ibGFrZTMtYWVzLTEyOC1nY206TWpBMFl6Z3daakJsTTJaa05tUmxOQT09OlpETmpNR1E0WkRjdE5qUmpOeTAwT0E9PQ@hkaws.go52pokemon.com:54259#🇹🇼台湾家宽节点
 # 旧式整段 Base64 Shadowsocks 格式也支持

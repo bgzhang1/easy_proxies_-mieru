@@ -18,10 +18,13 @@ import (
 	poolout "easy_proxies/internal/outbound/pool"
 	"easy_proxies/internal/ssuri"
 
+	mieruappctl "github.com/enfein/mieru/v3/pkg/appctl"
+	mierupb "github.com/enfein/mieru/v3/pkg/appctl/appctlpb"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/auth"
 	"github.com/sagernet/sing/common/json/badoption"
+	"google.golang.org/protobuf/proto"
 )
 
 // Build converts high level config into sing-box Options tree.
@@ -540,9 +543,334 @@ func buildNodeOutbound(tag, rawURI string, skipCertVerify bool) (option.Outbound
 			return option.Outbound{}, err
 		}
 		return option.Outbound{Type: C.TypeHysteria, Tag: tag, Options: &opts}, nil
+	case "mieru", "mierus":
+		opts, err := buildMieruOptions(rawURI, parsed)
+		if err != nil {
+			return option.Outbound{}, err
+		}
+		return option.Outbound{Type: C.TypeMieru, Tag: tag, Options: &opts}, nil
 	default:
 		return option.Outbound{}, fmt.Errorf("unsupported scheme %q", parsed.Scheme)
 	}
+}
+
+func buildMieruOptions(rawURI string, parsed *url.URL) (option.MieruOutboundOptions, error) {
+	switch strings.ToLower(parsed.Scheme) {
+	case "mierus":
+		profile, err := mieruappctl.URLToClientProfile(rawURI)
+		if err == nil {
+			return mieruProfileToOutboundOptions(profile)
+		}
+		return buildMieruDirectURLOptions(parsed)
+	case "mieru":
+		if parsed.User != nil {
+			return buildMieruDirectURLOptions(parsed)
+		}
+		clientConfig, err := mieruappctl.URLToClientConfig(rawURI)
+		if err != nil {
+			return option.MieruOutboundOptions{}, fmt.Errorf("parse mieru config URL: %w", err)
+		}
+		profile := selectMieruProfile(clientConfig)
+		if profile == nil {
+			return option.MieruOutboundOptions{}, errors.New("mieru config contains no usable profile")
+		}
+		return mieruProfileToOutboundOptions(profile)
+	default:
+		return option.MieruOutboundOptions{}, fmt.Errorf("unsupported mieru scheme %q", parsed.Scheme)
+	}
+}
+
+func selectMieruProfile(clientConfig *mierupb.ClientConfig) *mierupb.ClientProfile {
+	if clientConfig == nil {
+		return nil
+	}
+	profiles := clientConfig.GetProfiles()
+	if len(profiles) == 0 {
+		return nil
+	}
+	active := strings.TrimSpace(clientConfig.GetActiveProfile())
+	if active != "" {
+		for _, profile := range profiles {
+			if profile.GetProfileName() == active {
+				return profile
+			}
+		}
+	}
+	return profiles[0]
+}
+
+func mieruProfileToOutboundOptions(profile *mierupb.ClientProfile) (option.MieruOutboundOptions, error) {
+	if profile == nil {
+		return option.MieruOutboundOptions{}, errors.New("mieru profile is nil")
+	}
+	user := profile.GetUser()
+	if user.GetName() == "" {
+		return option.MieruOutboundOptions{}, errors.New("mieru profile missing username")
+	}
+	if user.GetPassword() == "" {
+		return option.MieruOutboundOptions{}, errors.New("mieru profile missing password")
+	}
+
+	servers := profile.GetServers()
+	if len(servers) == 0 {
+		return option.MieruOutboundOptions{}, errors.New("mieru profile contains no server")
+	}
+	opts, err := mieruServerToOptions(servers[0])
+	if err != nil {
+		return option.MieruOutboundOptions{}, err
+	}
+	opts.UserName = user.GetName()
+	opts.Password = user.GetPassword()
+	if mux := profile.GetMultiplexing(); mux != nil && mux.GetLevel() != mierupb.MultiplexingLevel_MULTIPLEXING_DEFAULT {
+		opts.Multiplexing = mux.GetLevel().String()
+	}
+	if trafficPattern := profile.GetTrafficPattern(); trafficPattern != nil {
+		encoded, err := marshalMieruTrafficPattern(trafficPattern)
+		if err != nil {
+			return option.MieruOutboundOptions{}, err
+		}
+		opts.TrafficPattern = encoded
+	}
+	return opts, nil
+}
+
+func mieruServerToOptions(server *mierupb.ServerEndpoint) (option.MieruOutboundOptions, error) {
+	if server == nil {
+		return option.MieruOutboundOptions{}, errors.New("mieru server is nil")
+	}
+	host := server.GetDomainName()
+	if host == "" {
+		host = server.GetIpAddress()
+	}
+	if host == "" {
+		return option.MieruOutboundOptions{}, errors.New("mieru server missing address")
+	}
+
+	opts := option.MieruOutboundOptions{
+		ServerOptions: option.ServerOptions{Server: host},
+	}
+	var transport string
+	for _, binding := range server.GetPortBindings() {
+		bindingTransport, err := normalizeMieruTransport(binding.GetProtocol().String())
+		if err != nil {
+			return option.MieruOutboundOptions{}, err
+		}
+		if transport == "" {
+			transport = bindingTransport
+		} else if bindingTransport != transport {
+			return option.MieruOutboundOptions{}, errors.New("mieru profile uses mixed TCP/UDP port bindings; mbox outbound supports one transport per node")
+		}
+
+		if portRange := binding.GetPortRange(); portRange != "" {
+			normalizedRange, err := normalizeMieruPortRange(portRange)
+			if err != nil {
+				return option.MieruOutboundOptions{}, err
+			}
+			opts.ServerPortRanges = append(opts.ServerPortRanges, normalizedRange)
+			continue
+		}
+		port := int(binding.GetPort())
+		if err := validateMieruPort(port); err != nil {
+			return option.MieruOutboundOptions{}, err
+		}
+		if opts.ServerPort == 0 {
+			opts.ServerPort = uint16(port)
+		} else {
+			opts.ServerPortRanges = append(opts.ServerPortRanges, fmt.Sprintf("%d-%d", port, port))
+		}
+	}
+	if transport == "" {
+		return option.MieruOutboundOptions{}, errors.New("mieru server contains no port binding")
+	}
+	opts.Transport = transport
+	return opts, nil
+}
+
+func marshalMieruTrafficPattern(pattern proto.Message) (string, error) {
+	raw, err := proto.Marshal(pattern)
+	if err != nil {
+		return "", fmt.Errorf("marshal mieru traffic pattern: %w", err)
+	}
+	return base64.StdEncoding.EncodeToString(raw), nil
+}
+
+func buildMieruDirectURLOptions(u *url.URL) (option.MieruOutboundOptions, error) {
+	if u == nil {
+		return option.MieruOutboundOptions{}, errors.New("mieru URI is nil")
+	}
+	if u.User == nil {
+		return option.MieruOutboundOptions{}, errors.New("mieru URI missing userinfo")
+	}
+	username := u.User.Username()
+	password, _ := u.User.Password()
+	if username == "" {
+		return option.MieruOutboundOptions{}, errors.New("mieru URI missing username")
+	}
+	if password == "" {
+		return option.MieruOutboundOptions{}, errors.New("mieru URI missing password")
+	}
+	server := u.Hostname()
+	if server == "" {
+		return option.MieruOutboundOptions{}, errors.New("mieru URI missing host")
+	}
+
+	query := u.Query()
+	transport := query.Get("transport")
+	if transport == "" {
+		transport = firstNonEmpty(query["protocol"])
+	}
+	if transport == "" {
+		transport = "TCP"
+	}
+	transport, err := normalizeMieruTransport(transport)
+	if err != nil {
+		return option.MieruOutboundOptions{}, err
+	}
+
+	opts := option.MieruOutboundOptions{
+		ServerOptions: option.ServerOptions{Server: server},
+		Transport:     transport,
+		UserName:      username,
+		Password:      password,
+		Multiplexing:  normalizeMieruMultiplexing(query.Get("multiplexing")),
+	}
+	if trafficPattern := query.Get("traffic-pattern"); trafficPattern != "" {
+		opts.TrafficPattern = trafficPattern
+	} else if trafficPattern := query.Get("traffic_pattern"); trafficPattern != "" {
+		opts.TrafficPattern = trafficPattern
+	}
+	if portText := strings.TrimSpace(u.Port()); portText != "" {
+		port, err := strconv.Atoi(portText)
+		if err != nil {
+			return option.MieruOutboundOptions{}, fmt.Errorf("invalid mieru port %q", portText)
+		}
+		if err := validateMieruPort(port); err != nil {
+			return option.MieruOutboundOptions{}, err
+		}
+		opts.ServerPort = uint16(port)
+	}
+
+	if err := addMieruPortsFromQuery(&opts, query, transport); err != nil {
+		return option.MieruOutboundOptions{}, err
+	}
+	if opts.ServerPort == 0 && len(opts.ServerPortRanges) == 0 {
+		return option.MieruOutboundOptions{}, errors.New("mieru URI missing port")
+	}
+	return opts, nil
+}
+
+func addMieruPortsFromQuery(opts *option.MieruOutboundOptions, query url.Values, expectedTransport string) error {
+	portValues := append([]string{}, query["port"]...)
+	portValues = append(portValues, splitCommaValues(query.Get("ports"))...)
+	portValues = append(portValues, splitCommaValues(query.Get("server_ports"))...)
+	protocolValues := query["protocol"]
+	for idx, portValue := range portValues {
+		if idx < len(protocolValues) && strings.TrimSpace(protocolValues[idx]) != "" {
+			transport, err := normalizeMieruTransport(protocolValues[idx])
+			if err != nil {
+				return err
+			}
+			if transport != expectedTransport {
+				return errors.New("mieru URI uses mixed TCP/UDP port bindings; mbox outbound supports one transport per node")
+			}
+		}
+		if strings.Contains(portValue, "-") {
+			portRange, err := normalizeMieruPortRange(portValue)
+			if err != nil {
+				return err
+			}
+			opts.ServerPortRanges = append(opts.ServerPortRanges, portRange)
+			continue
+		}
+		port, err := strconv.Atoi(strings.TrimSpace(portValue))
+		if err != nil {
+			return fmt.Errorf("invalid mieru port %q", portValue)
+		}
+		if err := validateMieruPort(port); err != nil {
+			return err
+		}
+		if opts.ServerPort == 0 {
+			opts.ServerPort = uint16(port)
+		} else {
+			opts.ServerPortRanges = append(opts.ServerPortRanges, fmt.Sprintf("%d-%d", port, port))
+		}
+	}
+	return nil
+}
+
+func normalizeMieruTransport(value string) (string, error) {
+	switch strings.ToUpper(strings.TrimSpace(value)) {
+	case "TCP":
+		return "TCP", nil
+	case "UDP":
+		return "UDP", nil
+	default:
+		return "", fmt.Errorf("unsupported mieru transport %q", value)
+	}
+}
+
+func normalizeMieruMultiplexing(value string) string {
+	value = strings.ToUpper(strings.TrimSpace(value))
+	if value == "MULTIPLEXING_DEFAULT" {
+		return ""
+	}
+	return value
+}
+
+func normalizeMieruPortRange(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	parts := strings.Split(value, "-")
+	if len(parts) != 2 {
+		return "", fmt.Errorf("invalid mieru port range %q", value)
+	}
+	begin, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+	if err != nil {
+		return "", fmt.Errorf("invalid mieru port range %q", value)
+	}
+	end, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err != nil {
+		return "", fmt.Errorf("invalid mieru port range %q", value)
+	}
+	if err := validateMieruPort(begin); err != nil {
+		return "", err
+	}
+	if err := validateMieruPort(end); err != nil {
+		return "", err
+	}
+	if begin > end {
+		return "", fmt.Errorf("invalid mieru port range %q", value)
+	}
+	return fmt.Sprintf("%d-%d", begin, end), nil
+}
+
+func validateMieruPort(port int) error {
+	if port < 1 || port > 65535 {
+		return fmt.Errorf("invalid mieru port %d", port)
+	}
+	return nil
+}
+
+func firstNonEmpty(values []string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func splitCommaValues(value string) []string {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	parts := strings.Split(value, ",")
+	values := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part = strings.TrimSpace(part); part != "" {
+			values = append(values, part)
+		}
+	}
+	return values
 }
 
 func buildVLESSOptions(u *url.URL, skipCertVerify bool) (option.VLESSOutboundOptions, error) {

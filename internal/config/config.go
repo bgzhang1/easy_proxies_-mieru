@@ -975,7 +975,7 @@ func isBase64(s string) bool {
 
 // IsProxyURI checks if a string is a valid proxy URI
 func IsProxyURI(s string) bool {
-	schemes := []string{"vmess://", "vless://", "trojan://", "ss://", "shadowsocks://", "ssr://", "hysteria://", "hysteria2://", "hy2://", "tuic://", "socks5://", "socks5h://", "socks://", "http://", "https://", "anytls://"}
+	schemes := []string{"vmess://", "vless://", "trojan://", "ss://", "shadowsocks://", "ssr://", "hysteria://", "hysteria2://", "hy2://", "tuic://", "mieru://", "mierus://", "socks5://", "socks5h://", "socks://", "http://", "https://", "anytls://"}
 	lower := strings.ToLower(s)
 	for _, scheme := range schemes {
 		if strings.HasPrefix(lower, scheme) {
@@ -1007,6 +1007,33 @@ func (fi *flexInt) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	return nil
 }
 
+type flexStringList []string
+
+func (sl *flexStringList) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var listVal []string
+	if err := unmarshal(&listVal); err == nil {
+		*sl = flexStringList(listVal)
+		return nil
+	}
+	var strVal string
+	if err := unmarshal(&strVal); err != nil {
+		return fmt.Errorf("cannot unmarshal string list: expected string or []string")
+	}
+	if strings.TrimSpace(strVal) == "" {
+		*sl = nil
+		return nil
+	}
+	parts := strings.Split(strVal, ",")
+	values := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part = strings.TrimSpace(part); part != "" {
+			values = append(values, part)
+		}
+	}
+	*sl = flexStringList(values)
+	return nil
+}
+
 type clashConfig struct {
 	Proxies []yaml.Node `yaml:"proxies"`
 }
@@ -1017,6 +1044,9 @@ type clashProxy struct {
 	Server            string                 `yaml:"server"`
 	Port              flexInt                `yaml:"port"`
 	Ports             string                 `yaml:"ports"`
+	ServerPorts       flexStringList         `yaml:"server-ports"`
+	ServerPortsAlt    flexStringList         `yaml:"server_ports"`
+	Username          string                 `yaml:"username"`
 	UUID              string                 `yaml:"uuid"`
 	Password          string                 `yaml:"password"`
 	Cipher            string                 `yaml:"cipher"`
@@ -1053,6 +1083,11 @@ type clashProxy struct {
 	RecvWindow     uint64 `yaml:"recv-window"`
 	RecvWindowConn uint64 `yaml:"recv-window-conn"`
 	DisableMTU     bool   `yaml:"disable_mtu_discovery"`
+	// Mieru-specific fields
+	Transport         string `yaml:"transport"`
+	MieruMultiplexing string `yaml:"multiplexing"`
+	TrafficPattern    string `yaml:"traffic-pattern"`
+	TrafficPatternAlt string `yaml:"traffic_pattern"`
 }
 
 type clashWSOptions struct {
@@ -1122,6 +1157,8 @@ func convertClashProxyToURI(p clashProxy) string {
 		return buildHysteria2URI(p)
 	case "tuic":
 		return buildTUICURI(p)
+	case "mieru":
+		return buildMieruURI(p)
 	case "ssr", "shadowsocksr":
 		return buildShadowsocksRURI(p)
 	case "hysteria":
@@ -1360,6 +1397,95 @@ func buildTUICURI(p clashProxy) string {
 
 	// TUIC URI format: tuic://uuid:password@server:port?params#name
 	return fmt.Sprintf("tuic://%s:%s@%s:%d%s#%s", p.UUID, p.Password, p.Server, int(p.Port), query, url.QueryEscape(p.Name))
+}
+
+func buildMieruURI(p clashProxy) string {
+	username := strings.TrimSpace(p.Username)
+	if username == "" {
+		return ""
+	}
+	password := strings.TrimSpace(p.Password)
+	if password == "" || strings.TrimSpace(p.Server) == "" {
+		return ""
+	}
+
+	transport := normalizeMieruTransportValue(p.Transport)
+	if transport == "" {
+		transport = normalizeMieruTransportValue(p.Protocol)
+	}
+	if transport == "" {
+		transport = "TCP"
+	}
+
+	params := url.Values{}
+	params.Set("profile", defaultStr(sanitizeMieruProfileName(p.Name), "default"))
+	if p.MieruMultiplexing != "" {
+		params.Set("multiplexing", strings.ToUpper(strings.TrimSpace(p.MieruMultiplexing)))
+	}
+	trafficPattern := p.TrafficPattern
+	if trafficPattern == "" {
+		trafficPattern = p.TrafficPatternAlt
+	}
+	if trafficPattern != "" {
+		params.Set("traffic-pattern", trafficPattern)
+	}
+
+	addMieruPortParam := func(portValue string) {
+		portValue = strings.TrimSpace(portValue)
+		if portValue == "" {
+			return
+		}
+		params.Add("port", strings.Replace(portValue, ":", "-", 1))
+		params.Add("protocol", transport)
+	}
+	if int(p.Port) > 0 {
+		addMieruPortParam(strconv.Itoa(int(p.Port)))
+	}
+	for _, portValue := range strings.Split(p.Ports, ",") {
+		addMieruPortParam(portValue)
+	}
+	for _, portValue := range append([]string(p.ServerPorts), []string(p.ServerPortsAlt)...) {
+		addMieruPortParam(portValue)
+	}
+	if len(params["port"]) == 0 {
+		return ""
+	}
+
+	u := url.URL{
+		Scheme: "mierus",
+		User:   url.UserPassword(username, password),
+		Host:   hostForURI(p.Server),
+	}
+	u.RawQuery = params.Encode()
+	u.Fragment = p.Name
+	return u.String()
+}
+
+func normalizeMieruTransportValue(value string) string {
+	switch strings.ToUpper(strings.TrimSpace(value)) {
+	case "TCP":
+		return "TCP"
+	case "UDP":
+		return "UDP"
+	default:
+		return ""
+	}
+}
+
+func sanitizeMieruProfileName(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	return name
+}
+
+func hostForURI(host string) string {
+	host = strings.TrimSpace(host)
+	if strings.Contains(host, ":") && net.ParseIP(host) != nil {
+		return "[" + host + "]"
+	}
+	return host
 }
 
 // buildShadowsocksRURI converts a Clash SSR proxy config to an SSR URI.

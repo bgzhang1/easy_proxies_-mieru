@@ -19,6 +19,7 @@ import (
 
 	"easy_proxies/internal/ssuri"
 
+	mieruappctl "github.com/enfein/mieru/v3/pkg/appctl"
 	"github.com/oschwald/geoip2-golang"
 )
 
@@ -510,11 +511,16 @@ func extractHostFromURI(uri string) string {
 		return extractSSRHost(uri)
 	}
 
+	if strings.HasPrefix(lowerURI, "mieru://") {
+		return extractMieruHost(uri)
+	}
+
 	// All other standard URL-parseable schemes
 	standardSchemes := []string{
 		"vless://", "trojan://",
 		"hysteria://", "hysteria2://", "hy2://",
 		"anytls://", "tuic://",
+		"mierus://",
 		"socks5://", "socks5h://", "socks://",
 		"http://", "https://",
 	}
@@ -534,6 +540,38 @@ func extractHostFromURI(uri string) string {
 		return ""
 	}
 	return parsed.Hostname()
+}
+
+func extractMieruHost(uri string) string {
+	parsed, err := url.Parse(uri)
+	if err == nil && parsed.User != nil && parsed.Hostname() != "" {
+		return parsed.Hostname()
+	}
+	clientConfig, err := mieruappctl.URLToClientConfig(uri)
+	if err != nil {
+		return ""
+	}
+	profiles := clientConfig.GetProfiles()
+	if len(profiles) == 0 {
+		return ""
+	}
+	profile := profiles[0]
+	if active := strings.TrimSpace(clientConfig.GetActiveProfile()); active != "" {
+		for _, candidate := range profiles {
+			if candidate.GetProfileName() == active {
+				profile = candidate
+				break
+			}
+		}
+	}
+	servers := profile.GetServers()
+	if len(servers) == 0 {
+		return ""
+	}
+	if host := servers[0].GetDomainName(); host != "" {
+		return host
+	}
+	return servers[0].GetIpAddress()
 }
 
 // extractVMessHost extracts the server address from a vmess:// URI.

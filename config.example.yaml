@@ -169,6 +169,8 @@ nodes:
 #             ss://base64(method:password)@server:port#name
 #             ss://base64(method:password@server:port)#name
 # - Hysteria2: hy2://password@server:port?params#name
+# - Mieru:   mierus://user:password@server?profile=default&port=2999&protocol=TCP#name
+#            mieru://base64_encoded_full_client_config
 # - SOCKS5:  socks5://[user:pass@]server:port#name
 # - HTTP:    http://[user:pass@]server:port#name
 #            https://[user:pass@]server:port#name

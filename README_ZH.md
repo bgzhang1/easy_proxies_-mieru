@@ -157,6 +157,7 @@ dns:
 - `http` / `https`
 - `anytls`
 - `tuic`
+- `mieru` / `mierus`
 
 订阅解析阶段可能识别到更多 URI 前缀（兼容输入），但不在上述列表中的协议会在构建阶段被跳过。
 

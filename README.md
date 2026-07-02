@@ -7,7 +7,7 @@
 ## Features
 
 - **Three runtime modes**: `pool` (single-port load balancing), `multi-port` (one port per node), and `hybrid` (both simultaneously)
-- **Wide protocol support**: VLESS, VMess, Trojan, Shadowsocks, Hysteria2, TUIC, AnyTLS, SOCKS5, HTTP/HTTPS
+- **Wide protocol support**: VLESS, VMess, Trojan, Shadowsocks, Hysteria2, TUIC, AnyTLS, Mieru, SOCKS5, HTTP/HTTPS
 - **Automatic health checking** with configurable failure thresholds and blacklist duration, plus manual blacklist/release from the dashboard
 - **Automatic fail-over retry**: when a node's dial fails, the request is retried on another healthy node (configurable attempts)
 - **GeoIP region routing**: classify nodes by country and route traffic through a specific region via a dedicated HTTP proxy endpoint
@@ -271,6 +271,7 @@ resp, err := client.Get("http://example.com")
 | Hysteria2 | `hysteria2://`, `hy2://` | QUIC-based |
 | TUIC | `tuic://` | QUIC-based |
 | AnyTLS | `anytls://` | TLS |
+| Mieru | `mieru://`, `mierus://` | TCP or UDP via mbox |
 | SOCKS5 | `socks5://`, `socks5h://`, `socks://` | Direct |
 | HTTP | `http://`, `https://` | Direct |
 
@@ -282,6 +283,7 @@ resp, err := client.Get("http://example.com")
 nodes:
   - uri: "vless://uuid@server:443?security=tls&type=ws&path=/path#Name"
   - uri: "ss://base64(method:password@server:port)#Name"
+  - uri: "mierus://user:password@server?profile=default&port=2999&protocol=TCP#Name"
 ```
 
 ### Nodes File
